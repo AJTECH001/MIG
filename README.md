@@ -1,282 +1,140 @@
-# Midnight Identity Gateway
+# Midnight Identity Gateway (MIG)
 
-This project is built on the [Midnight Network](https://midnight.network/).
+MIG is an experimental identity- and eligibility-verification infrastructure project on the
+[Midnight Network](https://midnight.network/). It centers on a Compact smart contract — the
+**Verification Registry V3** — that verifies a narrow, Compact-native issuer-signed credential
+profile and gates a one-shot protected action behind a consented, verified request.
 
-[![Generic badge](https://img.shields.io/badge/Compact%20Compiler-0.31.1-1abc9c.svg)](https://shields.io/)
-[![Generic badge](https://img.shields.io/badge/TypeScript-5.9.3-blue.svg)](https://shields.io/)
+> **Status: research / engineering prototype.** Verification is **local-only** against an
+> ephemeral test network. This is **not** a production identity provider and has **not** been
+> deployed to Preprod or Mainnet.
 
+## Scope and honesty notes
 
-> **Use this repo as a template. Do not fork it.**
->  
-> This repository is intended to be used via GitHub’s “Use this template” flow.  
-> Forking this repo is discouraged, as forks are not tracked as independent projects.
+- **Local-only.** Verification runs against an ephemeral, testcontainers-managed local Midnight
+  network. No Preprod or Mainnet deployment has been performed.
+- **Not production-ready.** The contract and tooling are a working prototype, not audited
+  infrastructure.
+- **Narrow credential profile.** The contract verifies possession of an issuer-authorized
+  **Compact-native Schnorr** credential profile. It does **not** prove real-world identity.
+- **No advanced privacy guarantees.** This project does **not** implement selective disclosure,
+  unlinkability, or general W3C VC/VP compatibility, and makes no such claims.
+- **Preprod path not executed.** The `npm run preprod-registry --prefix bboard-cli` path has not
+  been run because a Blockfrost project token and a funded wallet are not configured.
 
-This repository develops reusable identity and eligibility infrastructure on Midnight. The bulletin-board contract and DApp are retained as reference scaffolding; they are not the product boundary.
+## Architecture
 
-## Current Identity-Gateway Contract Foundation
+An npm workspaces monorepo:
 
-The contract workspace now contains a separate V3 Verification Registry alongside the unchanged BBoard example. The registry verifies an issuer-authorized Compact-native Schnorr credential profile, binds its claims to a consented request, checks a status authority's active/revoked state, and gates a one-shot action. Freshness and expiry are relative to verifier-supplied time, and the contract does not prove real-world identity, implement generic W3C VC/VP, or provide selective disclosure. Local proof generation and local-node execution are documented. The separate `npm run preprod-registry --prefix bboard-cli` path was not run because Blockfrost credentials and a wallet seed file are not configured; funding was not checked. See the [contract README](./contract/README.md) for its interface, evidence, prerequisites, and limitations.
+| Workspace | Purpose |
+| --- | --- |
+| `contract/` | Compact sources and generated bindings. `src/verification-registry.compact` is the V3 registry; `src/bboard.compact` is a retained bulletin-board reference example (scaffolding); `src/test/` holds the vitest suites, including the adversarial suite. |
+| `api/` | Shared types, classes, and helpers used by the CLI and UI. |
+| `bboard-cli/` | Command-line interface, local Stage C runner, and the (unrun) Preprod runner. |
+| `bboard-ui/` | Browser UI for the bulletin-board reference DApp (Lace wallet). |
 
-## Project Structure
+## Verification Registry V3 (implemented)
 
-```
-bulletin-board/
-├── contract/               # Smart contract in Compact language
-│   └── src/               # Contract source and utilities
-├── api/                   # Methods, classes and types for CLI and UI
-├── bboard-cli/            # Command-line interface
-│   └── src/               # CLI implementation
-└── bboard-ui/             # Web browser interface
-    └── src/               # Web UI implementation
-```
+**Request state machine:** `unregistered → PENDING → CONSENTED → VERIFIED → CONSUMED`.
+`DECLINED`, `CANCELLED`, `DENIED`, and `CONSUMED` are terminal states.
+
+**Credential status:** `UNKNOWN → ACTIVE → REVOKED` (revocation is irreversible).
+
+**Checks enforced on `decide` / `protectedAction`:**
+
+- Issuer authorization via the upstream `@midnight-ntwrk/credential-compact`
+  (`VC::assertAuthorizedIssuerProof`) with Jubjub Schnorr signatures.
+- Request-context binding (registry / request / application / subject / purpose / policy digests).
+- Holder binding, and binding of the proof challenge to the request id and the proof creation
+  time to the credential issuance time.
+- Freshness and expiry evaluated against **verifier-supplied time**.
+- Credential status must be `ACTIVE`.
+- A **one-shot protected action**: increments `protectedActionCount` and moves the request to
+  `CONSUMED`.
 
 ## Prerequisites
 
-### 1. Node.js Version Check
+- **Node.js >= 24.11.1** (`.nvmrc` pins `24.11.1`; the contract CI workflow uses Node 24).
+- **Docker** — for the local Midnight node/indexer and the proof server.
+- **Compact compiler 0.31.1** (`compact`) on `PATH`.
+- Proof server image `midnightntwrk/proof-server:8.0.3` (pulled automatically).
 
-You need Node.js:
-
-```bash
-node --version
-```
-
-Expected output: `v24.11.1` or higher. The repository includes an [.nvmrc](./.nvmrc) pinned to `24.11.1`.
-
-If you get a lower version: [Install Node.js LTS](https://nodejs.org/).
-
-### 2. Docker Installation
-
-The [proof server](https://docs.midnight.network/develop/tutorial/using/proof-server) runs in Docker and is required for both CLI and UI to generate zero-knowledge proofs:
-
-```bash
-docker --version
-```
-
-Expected output: `Docker version X.X.X`.
-
-If Docker is not found: [Install Docker Desktop](https://docs.docker.com/desktop/). Make sure Docker Desktop is running.
-
-### 3. Lace Wallet Extension (UI Only)
-
-For the web interface, install the official Lace wallet extension on [Chrome Store](https://chromewebstore.google.com/detail/lace/gafhhkghbfjjkeiendhlofajokpaflmk) or the [Edge Store](https://microsoftedge.microsoft.com/addons/detail/lace/efeiemlfnahiidnjglmehaihacglceia) (tested with version 1.36.0).
-
-After installing, set up the Midnight wallet:
-
-1. Create a **new wallet** — Midnight will appear as a network option
-2. Set **Network** to **Preprod**
-3. Set **Proof server** to **Local (http://localhost:6300)** — this must point to your local proof server started via Docker
-4. Click **Enter Wallet**
-5. Fund your wallet with tNIGHT tokens from the [Preprod Faucet](https://midnight-tmnight-preprod.nethermind.dev/)
-6. Go to **Tokens** in the wallet, click **Generate tDUST**, and confirm the transaction — tDUST tokens are required to pay transaction fees on preprod
-
-## Setup Instructions
-
-### Install Project Dependencies
+## Install
 
 ```bash
 npm install
 ```
 
-This repository uses npm workspaces. Run installation once from the repository root.
+## Build and test
 
-### Compile the Smart Contract
-
-The Compact compiler (`compactc 0.31.1`) generates TypeScript bindings and zero-knowledge circuits from the smart contract source code:
-
-```bash
-cd contract
-npm run compact    # Compiles the Compact contract
-npm run build      # Copies compiled files to dist/
-cd ..
-```
-
-Expected output:
-
-```
-> compact
-> compact compile src/bboard.compact ./src/managed/bboard
-
-Compiling 2 circuits:
-  circuit "post" (k=14, rows=10070)
-  circuit "takeDown" (k=14, rows=10087)
-
-> build
-> rm -rf dist && tsc --project tsconfig.build.json && cp -Rf ./src/managed ./dist/managed && cp ./src/bboard.compact ./dist
-
-```
-
-### Build the CLI Interface
+Compile the Compact contracts (required before building the CLI or UI — generated `managed/`
+artifacts are not committed):
 
 ```bash
+npm run compact --prefix contract
+npm run build   --prefix contract
+```
+
+Run the contract test suite:
+
+```bash
+npm test --prefix contract -- --run      # 58 tests
+```
+
+Full contract CI (compact + typecheck + lint + build + test):
+
+```bash
+npm run ci --prefix contract
+```
+
+CLI CI (typecheck + lint + build):
+
+```bash
+npm run ci --prefix bboard-cli
+```
+
+## Local end-to-end procedure (Stage C)
+
+Stage C deploys the **current V3 artifacts** to an ephemeral testcontainers local network
+(Midnight node + indexer) and exercises the full lifecycle plus adversarial negative cases. It
+requires the compiled artifacts from the build step above and a running local proof server.
+
+```bash
+# 1. Start the local proof server (http://127.0.0.1:6300)
+docker compose -f bboard-cli/proof-server-local.yml up -d
+
+# 2. Run Stage C (spins up an ephemeral node + indexer, then tears them down)
 cd bboard-cli
-npm run build
-cd ..
+node --experimental-specifier-resolution=node --loader ts-node/esm src/stage-c-registry-local.ts
 ```
 
-### Build the UI Interface (Optional)
+The runner injects the existing proof server on port `6300` (it does not start a second one) and
+tears down only its own compose project on exit. It never targets Preprod.
 
-Only needed if you want to use the web interface:
+**Behaviors exercised against a real local chain:**
 
-```bash
-cd bboard-ui
-npm run build
-cd ..
-```
+- Valid issuer-signed credential and protected action (successful transactions).
+- Altered signed claims / mismatched proof challenge / mismatched request context.
+- Expired and not-yet-valid credentials.
+- Revocation after approval but before the protected action.
+- Unauthorized verifier decisions and unauthorized revocation.
+- Repeated protected actions and terminal-state bypass attempts.
 
-## Option 1: CLI Interface
+### Evidence (current)
 
-### Start the Proof Server
+- Contract tests: **58 passed** (`vitest`).
+- Compact compilation, contract typecheck, lint, and build: **passed**.
+- CLI CI (typecheck, lint, build): **passed**.
+- Stage C: **deployed and executed** against an ephemeral local testkit network. Successful
+  transactions carried `SucceedEntirely` status; all adversarial cases were rejected before
+  submission (no failed on-chain transactions).
 
-The CLI requires a local proof server running in Docker:
+## Security
 
-```bash
-cd bboard-cli
-docker compose -f proof-server-local.yml up -d
-```
+Do not commit secrets. The repository excludes `.env*`, `project.md`, generated `managed/`,
+`dist/`, logs, local databases, and ZK proving keys. Report vulnerabilities as described in
+[SECURITY.md](./SECURITY.md).
 
-This uses `midnightntwrk/proof-server:8.0.3` on `http://127.0.0.1:6300`.
+## License
 
-### Run the CLI
-
-```bash
-# For preprod network
-npm run preprod-remote
-
-# For preview network
-npm run preview-remote
-```
-
-### Using the CLI
-
-#### Create a Wallet
-
-1. Choose option `1` to build a fresh wallet
-2. The system will generate a wallet address and seed
-3. **Save both the address and seed** - you'll need them later
-
-Expected output is similar to:
-
-```
-Your wallet seed is: [64-character hex string]
-Using unshielded address: mn_addr_preprod1hdvtst70zfgd8wvh7l8ppp7mcrxnjn56wc5hlxpwflz3fxdykaesrw0ln4 waiting for funds...
-```
-
-#### Fund Your Wallet
-
-Before deploying contracts, you need testnet tokens.
-
-1. Copy your wallet address from the output above
-2. Visit the [faucet](https://midnight-tmnight-preprod.nethermind.dev/)
-3. Paste your address and request funds
-4. Wait for the CLI to detect the funds (takes 2-3 minutes)
-
-Expected output after funding is similar to:
-
-```
-Your NIGHT wallet balance is: 1000000000
-```
-
-#### Deploy Your Contract
-
-1. Choose the contract deployment option
-2. Wait for deployment (takes ~30 seconds)
-3. **Save the contract address** for future use
-
-Expected output:
-
-```
-Deployed bulletin board contract at address: [contract address]
-```
-
-#### Use the Bulletin Board
-
-You can now:
-
-- **Post** a message to the bulletin board
-- **View** the current message
-- **Remove** your message (only if you posted it)
-- **Exit** when done
-
-Each action creates a real transaction on Midnight Testnet using zero-knowledge proofs generated by the proof server.
-
-## Option 2: Web UI Interface
-
-The web interface uses the same proof server and requires additional browser setup.
-
-### Start the Proof Server (if not already running)
-
-If you haven't started the proof server for the CLI, start it now:
-
-```bash
-cd bboard-cli
-docker compose -f proof-server-local.yml up -d
-cd ..
-```
-
-Verify it's running:
-
-```bash
-docker ps
-```
-
-### Start the Web Interface
-
-The UI can run against preprod or preview networks:
-
-```bash
-cd bboard-ui
-
-# For preprod network
-npm run build:start
-
-# For preview network
-npm run build:start:preview
-```
-
-The UI will be available at:
-
-- http://127.0.0.1:8080
-
-### Browser Setup
-
-1. **Open the UI URL** in a browser with Lace wallet extension installed
-2. **Set up Lace wallet** if it's your first time
-3. **Authorize the application** when Lace wallet prompts
-4. Use the bulletin board web interface
-
-## Useful Links
-
-- Get Testnet tNIGHT on [Preprod Faucet](https://midnight-tmnight-preprod.nethermind.dev/) or [Preview Faucet](https://midnight-tmnight-preview.nethermind.dev/)
-- [Midnight Documentation](https://docs.midnight.network/examples/dapps/bboard) - Complete developer guide
-- [Compatibility Matrix](https://docs.midnight.network/relnotes/support-matrix) - Current supported Midnight component versions
-- [Compact Language Guide](https://docs.midnight.network/compact/writing) - Smart contract language reference
-- Get Lace wallet on the [Chrome Store](https://chromewebstore.google.com/detail/lace/gafhhkghbfjjkeiendhlofajokpaflmk) or the [Edge Store](https://microsoftedge.microsoft.com/addons/detail/lace/efeiemlfnahiidnjglmehaihacglceia)
-
-## Troubleshooting
-
-| Common Issue                       | Solution                                                                                                  |
-| ---------------------------------- |-----------------------------------------------------------------------------------------------------------|
-| `npm install` fails                | Ensure you're using Node `v24.11.1` or newer. Older Node versions can install with warnings but are not the target runtime |
-| Contract compilation fails         | Ensure the Compact toolchain is installed and run `npm run compact` from `contract/`                      |
-| Network connection timeout         | CLI requires internet connection, restart if connection times out                                         |
-| Token funding takes too long       | Wait 1-2 minutes, funding is automatic in CLI                                                             |
-| "Application not authorized" error | Start proof server: `docker compose -f proof-server-local.yml up -d`                                      |
-| Lace wallet not detected           | Install Lace wallet browser extension and refresh page                                                    |
-| Docker issues                      | Ensure Docker Desktop is running, check `docker --version`                                                |
-| Port 6300 in use                   | Run `docker compose down` then restart services                                                           |
-| Dependencies won't install         | Use Node.js LTS version. For older npm versions, you may need `--legacy-peer-deps`                        |
-| Contract deployment fails          | Verify wallet has sufficient balance and network connection                                               |
-
-## Notes
-
-- CLI and UI can run simultaneously and share the same proof server
-- Proof server (Docker) is required for both CLI and UI to generate zero-knowledge proofs
-- Contract must be compiled before building CLI or UI
-- Fund your wallet using the testnet faucet before deploying contracts
-
-## Implementation Notes
-
-- **Transaction fee configuration**  
-  The default `additionalFeeOverhead` value (`500_000_000_000_000_000n`) from `@midnight-ntwrk/testkit-js` is required on the `undeployed` network. Lower values can fail with `BalanceCheckOverspend` on the node side. On remote networks, that overhead requires too much dust, so the CLI overrides it to `1_000n`.
-- CLI private state is stored per contract address, matching the `Midnight.js 4.x` private-state provider model.
-# MIG
+See [LICENSE](./LICENSE).

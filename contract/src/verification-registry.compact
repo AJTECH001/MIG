@@ -1,0 +1,438 @@
+pragma language_version 0.23;
+
+import CompactStandardLibrary;
+
+include "../../node_modules/@midnight-ntwrk/credential-compact/dist/credentials/composable";
+
+export enum VerificationProtocolVersion {
+  V3
+}
+
+export enum RequestState {
+  PENDING,
+  CONSENTED,
+  DECLINED,
+  VERIFIED,
+  DENIED,
+  CANCELLED,
+  CONSUMED
+}
+
+export enum CredentialStatus {
+  UNKNOWN,
+  ACTIVE,
+  REVOKED
+}
+
+export struct RegistryClaims {
+  registryId: Bytes<32>,
+  requestId: Bytes<32>,
+  applicationId: Bytes<32>,
+  subject: Bytes<32>,
+  claimDigest: Bytes<32>,
+  purposeDigest: Bytes<32>,
+  policyDigest: Bytes<32>
+}
+
+import VC<
+  RegistryClaims,
+  NoClaimCommitments,
+  Bytes<32>,
+  Bytes<32>
+> prefix RegistryVC_;
+
+struct VerificationRequest {
+  requester: Bytes<32>,
+  subject: Bytes<32>,
+  applicationId: Bytes<32>,
+  claimDigest: Bytes<32>,
+  purposeDigest: Bytes<32>,
+  policyDigest: Bytes<32>,
+  maxCredentialAge: Uint<64>,
+  credentialValidUntil: Uint<64>,
+  credentialStatusHandle: Bytes<32>,
+  evidenceDigest: Bytes<32>,
+  state: RequestState
+}
+
+export ledger protocolVersion: VerificationProtocolVersion;
+
+export ledger verifier: Bytes<32>;
+
+export ledger issuerAuthorization: AuthorizedSignerDescriptor;
+
+export ledger credentialSchema: SchemaRef;
+
+export ledger statusAuthority: Bytes<32>;
+
+export ledger credentialStatuses: Map<Bytes<32>, CredentialStatus>;
+
+export ledger requests: Map<Bytes<32>, VerificationRequest>;
+
+export ledger protectedActionCount: Counter;
+
+constructor(
+  verifierKey: Bytes<32>,
+  schema: SchemaRef,
+  issuer: AuthorizedSignerDescriptor,
+  statusAuthorityKey: Bytes<32>
+) {
+  assert(verifierKey != pad(32, ""), "Invalid verifier");
+  assert(statusAuthorityKey != pad(32, ""), "Invalid status authority");
+  assertValidAuthorizedSignerDescriptor(issuer);
+  assert(issuer.state == AuthorizationState.active, "Issuer must be active");
+  assert(issuer.role == SignerRole.issuer, "Authorization must be an issuer");
+  assert(
+    issuer.scopeCommitment == issuerScopeCommitment(schema),
+    "Issuer schema scope mismatch"
+  );
+  protocolVersion = VerificationProtocolVersion.V3;
+  verifier = disclose(verifierKey);
+  credentialSchema = disclose(schema);
+  issuerAuthorization = disclose(issuer);
+  statusAuthority = disclose(statusAuthorityKey);
+}
+
+witness localSecretKey(): Bytes<32>;
+
+export circuit identityKey(secretKey: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([
+    pad(32, "mig:auth-key:v3"),
+    secretKey
+  ]);
+}
+
+export circuit credentialBodyRoot(
+  credential: RegistryVC_Credential
+): Bytes<32> {
+  return RegistryVC_credentialBodyRoot(credential);
+}
+
+export circuit credentialClaimRoot(claims: RegistryClaims): Bytes<32> {
+  return persistentHash<RegistryClaims>(claims);
+}
+
+export circuit credentialStatusCommitment(statusHandle: Bytes<32>): Bytes<32> {
+  return persistentHash<Bytes<32>>(statusHandle);
+}
+
+circuit assertCredentialTimeValid(
+  issuedAt: Uint<64>,
+  maxCredentialAge: Uint<64>,
+  hasExpiration: Boolean,
+  expiresAt: Uint<64>
+): Uint<64> {
+  assert(issuedAt > 0, "Invalid credential issuance time");
+  assert(
+    !kernel.blockTimeLessThan(disclose(issuedAt)),
+    "Credential issued in the future"
+  );
+  const latestValidTime = (issuedAt + maxCredentialAge) as Uint<64>;
+  assert(
+    !kernel.blockTimeGreaterThan(disclose(latestValidTime)),
+    "Credential is too old"
+  );
+  if (hasExpiration) {
+    assert(
+      !kernel.blockTimeGreaterThan(disclose(expiresAt)),
+      "Credential expired"
+    );
+    if (expiresAt < latestValidTime) {
+      return expiresAt;
+    }
+  }
+  return latestValidTime;
+}
+
+export circuit registerRequest(
+  requestId: Bytes<32>,
+  applicationId: Bytes<32>,
+  subject: Bytes<32>,
+  claimDigest: Bytes<32>,
+  purposeDigest: Bytes<32>,
+  policyDigest: Bytes<32>,
+  maxCredentialAge: Uint<64>
+): [] {
+  const zeroValue = disclose(pad(32, ""));
+  assert(requestId != zeroValue, "Invalid request ID");
+  assert(applicationId != zeroValue, "Invalid application ID");
+  assert(subject != zeroValue, "Invalid subject");
+  assert(claimDigest != zeroValue, "Invalid claim digest");
+  assert(purposeDigest != zeroValue, "Invalid purpose digest");
+  assert(policyDigest != zeroValue, "Invalid policy digest");
+  assert(maxCredentialAge > 0, "Invalid maximum credential age");
+  assert(!requests.member(disclose(requestId)), "Duplicate request ID");
+  requests.insert(disclose(requestId), VerificationRequest {
+    requester: disclose(identityKey(localSecretKey())),
+    subject: disclose(subject),
+    applicationId: disclose(applicationId),
+    claimDigest: disclose(claimDigest),
+    purposeDigest: disclose(purposeDigest),
+    policyDigest: disclose(policyDigest),
+    maxCredentialAge: disclose(maxCredentialAge),
+    credentialValidUntil: 0,
+    credentialStatusHandle: zeroValue,
+    evidenceDigest: zeroValue,
+    state: RequestState.PENDING
+  });
+}
+
+export circuit consent(
+  requestId: Bytes<32>,
+  applicationId: Bytes<32>,
+  claimDigest: Bytes<32>,
+  purposeDigest: Bytes<32>,
+  policyDigest: Bytes<32>
+): [] {
+  assert(requests.member(disclose(requestId)), "Unknown request");
+  const request = requests.lookup(disclose(requestId));
+  assert(request.state == RequestState.PENDING, "Request is not pending");
+  assert(identityKey(localSecretKey()) == request.subject, "Not the subject");
+  assert(applicationId == request.applicationId, "Application mismatch");
+  assert(claimDigest == request.claimDigest, "Claim digest mismatch");
+  assert(purposeDigest == request.purposeDigest, "Purpose digest mismatch");
+  assert(policyDigest == request.policyDigest, "Policy digest mismatch");
+  requests.insert(disclose(requestId), VerificationRequest {
+    requester: request.requester,
+    subject: request.subject,
+    applicationId: request.applicationId,
+    claimDigest: request.claimDigest,
+    purposeDigest: request.purposeDigest,
+    policyDigest: request.policyDigest,
+    maxCredentialAge: request.maxCredentialAge,
+    credentialValidUntil: request.credentialValidUntil,
+    credentialStatusHandle: request.credentialStatusHandle,
+    evidenceDigest: request.evidenceDigest,
+    state: RequestState.CONSENTED
+  });
+}
+
+export circuit decline(
+  requestId: Bytes<32>,
+  applicationId: Bytes<32>,
+  claimDigest: Bytes<32>,
+  purposeDigest: Bytes<32>,
+  policyDigest: Bytes<32>
+): [] {
+  assert(requests.member(disclose(requestId)), "Unknown request");
+  const request = requests.lookup(disclose(requestId));
+  assert(request.state == RequestState.PENDING, "Request is not pending");
+  assert(identityKey(localSecretKey()) == request.subject, "Not the subject");
+  assert(applicationId == request.applicationId, "Application mismatch");
+  assert(claimDigest == request.claimDigest, "Claim digest mismatch");
+  assert(purposeDigest == request.purposeDigest, "Purpose digest mismatch");
+  assert(policyDigest == request.policyDigest, "Policy digest mismatch");
+  requests.insert(disclose(requestId), VerificationRequest {
+    requester: request.requester,
+    subject: request.subject,
+    applicationId: request.applicationId,
+    claimDigest: request.claimDigest,
+    purposeDigest: request.purposeDigest,
+    policyDigest: request.policyDigest,
+    maxCredentialAge: request.maxCredentialAge,
+    credentialValidUntil: request.credentialValidUntil,
+    credentialStatusHandle: request.credentialStatusHandle,
+    evidenceDigest: request.evidenceDigest,
+    state: RequestState.DECLINED
+  });
+}
+
+export circuit cancel(requestId: Bytes<32>): [] {
+  assert(requests.member(disclose(requestId)), "Unknown request");
+  const request = requests.lookup(disclose(requestId));
+  assert(request.state == RequestState.PENDING, "Request is not pending");
+  assert(identityKey(localSecretKey()) == request.requester, "Not the requester");
+  requests.insert(disclose(requestId), VerificationRequest {
+    requester: request.requester,
+    subject: request.subject,
+    applicationId: request.applicationId,
+    claimDigest: request.claimDigest,
+    purposeDigest: request.purposeDigest,
+    policyDigest: request.policyDigest,
+    maxCredentialAge: request.maxCredentialAge,
+    credentialValidUntil: request.credentialValidUntil,
+    credentialStatusHandle: request.credentialStatusHandle,
+    evidenceDigest: request.evidenceDigest,
+    state: RequestState.CANCELLED
+  });
+}
+
+export circuit activateCredentialStatus(statusHandle: Bytes<32>): [] {
+  assert(identityKey(localSecretKey()) == statusAuthority, "Not the status authority");
+  assert(statusHandle != disclose(pad(32, "")), "Invalid status handle");
+  const statusKey = disclose(credentialStatusCommitment(statusHandle));
+  assert(
+    !credentialStatuses.member(statusKey),
+    "Credential status already initialized"
+  );
+  credentialStatuses.insert(statusKey, CredentialStatus.ACTIVE);
+}
+
+export circuit revokeCredentialStatus(statusHandle: Bytes<32>): [] {
+  assert(identityKey(localSecretKey()) == statusAuthority, "Not the status authority");
+  assert(statusHandle != disclose(pad(32, "")), "Invalid status handle");
+  const statusKey = disclose(credentialStatusCommitment(statusHandle));
+  assert(credentialStatuses.member(statusKey), "Unknown credential status");
+  assert(
+    credentialStatuses.lookup(statusKey) == CredentialStatus.ACTIVE,
+    "Credential status is not active"
+  );
+  credentialStatuses.insert(statusKey, CredentialStatus.REVOKED);
+}
+
+export circuit decide(
+  requestId: Bytes<32>,
+  credential: RegistryVC_Credential,
+  issuerProof: Proof
+): [] {
+  assert(identityKey(localSecretKey()) == verifier, "Not the verifier");
+  assert(requests.member(disclose(requestId)), "Unknown request");
+  const request = requests.lookup(disclose(requestId));
+  assert(request.state == RequestState.CONSENTED, "Request is not consented");
+  assert(
+    credential.claims.registryId == kernel.self().bytes,
+    "Credential registry mismatch"
+  );
+  assert(
+    credential.claims.requestId == requestId,
+    "Credential request ID mismatch"
+  );
+  assert(
+    credential.claims.applicationId == request.applicationId,
+    "Credential application mismatch"
+  );
+  assert(credential.claims.subject == request.subject, "Credential subject mismatch");
+  assert(
+    credential.claims.claimDigest == request.claimDigest,
+    "Credential claim digest mismatch"
+  );
+  assert(
+    credential.claims.purposeDigest == request.purposeDigest,
+    "Credential purpose digest mismatch"
+  );
+  assert(
+    credential.claims.policyDigest == request.policyDigest,
+    "Credential policy digest mismatch"
+  );
+  assert(
+    credential.holderBinding == request.subject,
+    "Credential holder binding mismatch"
+  );
+  assertMatchingSchemaRefs(credentialSchema, credential.schema);
+  RegistryVC_assertValidCredentialEnvelope(
+    credential,
+    credentialClaimRoot(credential.claims)
+  );
+  RegistryVC_assertAuthorizedIssuerProof(
+    credential,
+    issuerProof,
+    issuerAuthorization
+  );
+  assert(
+    issuerProof.challengeHash == requestId,
+    "Proof challenge hash mismatch"
+  );
+  assert(
+    issuerProof.createdAt == credential.issuedAt,
+    "Proof creation time mismatch"
+  );
+  const validUntil = assertCredentialTimeValid(
+    credential.issuedAt,
+    request.maxCredentialAge,
+    disclose(credential.hasExpiration),
+    credential.expiresAt
+  );
+  assert(
+    credential.statusBinding != disclose(pad(32, "")),
+    "Invalid credential status handle"
+  );
+  const statusKey = disclose(credentialStatusCommitment(credential.statusBinding));
+  assert(
+    credentialStatuses.member(statusKey),
+    "Credential status is unknown"
+  );
+  assert(
+    credentialStatuses.lookup(statusKey) == CredentialStatus.ACTIVE,
+    "Credential is revoked"
+  );
+  const evidenceDigest = disclose(RegistryVC_credentialBodyRoot(credential));
+  requests.insert(disclose(requestId), VerificationRequest {
+    requester: request.requester,
+    subject: request.subject,
+    applicationId: request.applicationId,
+    claimDigest: request.claimDigest,
+    purposeDigest: request.purposeDigest,
+    policyDigest: request.policyDigest,
+    maxCredentialAge: request.maxCredentialAge,
+    credentialValidUntil: disclose(validUntil),
+    credentialStatusHandle: statusKey,
+    evidenceDigest: evidenceDigest,
+    state: RequestState.VERIFIED
+  });
+}
+
+export circuit deny(
+  requestId: Bytes<32>,
+  applicationId: Bytes<32>,
+  claimDigest: Bytes<32>,
+  purposeDigest: Bytes<32>,
+  policyDigest: Bytes<32>,
+  evidenceDigest: Bytes<32>
+): [] {
+  assert(identityKey(localSecretKey()) == verifier, "Not the verifier");
+  assert(requests.member(disclose(requestId)), "Unknown request");
+  const request = requests.lookup(disclose(requestId));
+  assert(request.state == RequestState.CONSENTED, "Request is not consented");
+  assert(applicationId == request.applicationId, "Application mismatch");
+  assert(claimDigest == request.claimDigest, "Claim digest mismatch");
+  assert(purposeDigest == request.purposeDigest, "Purpose digest mismatch");
+  assert(policyDigest == request.policyDigest, "Policy digest mismatch");
+  assert(evidenceDigest != disclose(pad(32, "")), "Invalid evidence digest");
+  requests.insert(disclose(requestId), VerificationRequest {
+    requester: request.requester,
+    subject: request.subject,
+    applicationId: request.applicationId,
+    claimDigest: request.claimDigest,
+    purposeDigest: request.purposeDigest,
+    policyDigest: request.policyDigest,
+    maxCredentialAge: request.maxCredentialAge,
+    credentialValidUntil: request.credentialValidUntil,
+    credentialStatusHandle: request.credentialStatusHandle,
+    evidenceDigest: disclose(evidenceDigest),
+    state: RequestState.DENIED
+  });
+}
+
+export circuit protectedAction(requestId: Bytes<32>): [] {
+  assert(requests.member(disclose(requestId)), "Unknown request");
+  const request = requests.lookup(disclose(requestId));
+  assert(request.state == RequestState.VERIFIED, "Request is not verified");
+  assert(identityKey(localSecretKey()) == request.subject, "Not the subject");
+  assert(
+    !kernel.blockTimeGreaterThan(disclose(request.credentialValidUntil)),
+    "Credential validity period ended"
+  );
+  assert(
+    credentialStatuses.member(request.credentialStatusHandle),
+    "Credential status is unknown"
+  );
+  assert(
+    credentialStatuses.lookup(request.credentialStatusHandle)
+      == CredentialStatus.ACTIVE,
+    "Credential is revoked"
+  );
+  requests.insert(disclose(requestId), VerificationRequest {
+    requester: request.requester,
+    subject: request.subject,
+    applicationId: request.applicationId,
+    claimDigest: request.claimDigest,
+    purposeDigest: request.purposeDigest,
+    policyDigest: request.policyDigest,
+    maxCredentialAge: request.maxCredentialAge,
+    credentialValidUntil: request.credentialValidUntil,
+    credentialStatusHandle: request.credentialStatusHandle,
+    evidenceDigest: request.evidenceDigest,
+    state: RequestState.CONSUMED
+  });
+  protectedActionCount.increment(1);
+}
